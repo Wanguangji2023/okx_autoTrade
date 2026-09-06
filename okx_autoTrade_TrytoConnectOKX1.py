@@ -3,13 +3,15 @@
 """
 OKX 实时成交价监听 + 多层次价位计算 + 动态止盈 + 钉钉提醒
 
-版本: v4.1
+版本: v4.2
 更新: 2026-09-06
 
-改进：
-- 未知错误处理：10分钟窗口内最多尝试2次，第一次失败延迟2分钟重试，第二次失败加入待观察列表
-- 错误分类：合规限制→黑名单；订单限制→待观察；其他→未知错误处理
-- 优化买入尝试计数逻辑，避免重复下单
+核心买入逻辑：
+1. 价格跌破任意买点（回撤2下/回调2下/过渡2下/极限2下）时，激活买入信号，记录当前最低价
+2. 价格继续下跌则更新最低价
+3. 当价格从最低价反弹1%且仍低于该买点时，执行买入
+4. 买入成功后或价格回升至买点之上时，信号自动取消
+5. 其他风控（黑名单、观察列表、静默期、持仓检查等）保持不变
 """
 
 import base64
@@ -34,7 +36,7 @@ load_dotenv()
 
 # ==================== 配置常量 ====================
 PROGRAM_NAME = "okx_ding_ok"
-VERSION = "v4.1"
+VERSION = "v4.2"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, f"{PROGRAM_NAME}_config.xlsx")
@@ -475,12 +477,6 @@ class PriceLevels:
             "transition2_down": ("transition_up", "过渡"),
             "limit2_down": ("limit_up", "极限"),
         }
-    
-    def get_buy_sell_pair(self, buy_key: str):
-        if buy_key in self.pair_map:
-            sell_key, pair_name = self.pair_map[buy_key]
-            return getattr(self, sell_key), sell_key, pair_name
-        return None, None, None
 
 # ==================== WebSocket 底层 ====================
 def recv_exact(sock, size):
@@ -1060,11 +1056,18 @@ class SymbolState:
         self.observe_list = load_observe_list()
 
         # 未知错误处理相关变量
-        self._first_fail_time = 0.0          # 第一次失败的时间戳（窗口起始）
-        self._fail_count_in_window = 0       # 窗口内失败计数
-        self._retry_after = 0.0              # 下次可尝试时间（第一次失败后延迟2分钟）
-        self._window_duration = 600          # 10分钟窗口（秒）
-        self._retry_delay = 120              # 2分钟延迟（秒）
+        self._first_fail_time = 0.0
+        self._fail_count_in_window = 0
+        self._retry_after = 0.0
+        self._window_duration = 600
+        self._retry_delay = 120
+
+        # 买入信号相关（新逻辑）
+        self.buy_signal_activated = False
+        self.buy_signal_lowest_price = 0.0
+        self.buy_signal_buy_level = ""
+        self.buy_signal_buy_price = 0.0
+        self.buy_signal_attempt_time = 0.0  # 上次尝试买入时间（防频繁尝试）
 
         self._okx_available = False
         if inst_id in self.blacklist:
@@ -1229,11 +1232,9 @@ class SymbolState:
         if self.inst_id in self.observe_list:
             return False, "在待观察列表中"
         if time.time() < self._balance_insufficient_until:
-            return False, f"余额不足冷却中"
-        # 检查未知错误重试延迟
-        now = time.time()
-        if now < self._retry_after:
-            return False, f"未知错误重试延迟中（剩余 {int(self._retry_after - now)} 秒）"
+            return False, "余额不足冷却中"
+        if time.time() < self._retry_after:
+            return False, f"未知错误重试延迟中（剩余 {int(self._retry_after - time.time())} 秒）"
         balance = get_okx_balance()
         raw_amount = balance * self.params.get("buy_ratio", 0.01)
         buy_amount = max(raw_amount, self.min_buy_amount)
@@ -1251,6 +1252,7 @@ class SymbolState:
         return (True, "") if self.has_position else (False, "无持仓")
 
     def _get_buy_level(self, price):
+        """返回当前价格下最佳买点（价格低于该买点且最接近）"""
         buy_keys = ["pullback2_down", "callback2_down", "transition2_down", "limit2_down"]
         best_key = None
         best_price = None
@@ -1263,14 +1265,12 @@ class SymbolState:
         return best_key, best_price
 
     def _execute_buy(self, price, reason, buy_key, sell_key, pair_name):
-        """执行买入，包含完整的错误分类和重试逻辑"""
-        # 余额检查
+        """执行买入，包含错误分类和重试逻辑"""
         balance = get_okx_balance(force_refresh=True)
         if balance < 110:
             self.logger.info(f"{self.inst_id} 账户余额 {balance:.2f} USDT 低于 110，跳过买入")
             return None
 
-        # 再次确认买入条件
         buy_level = getattr(self.levels, buy_key)
         if price >= buy_level:
             self.logger.debug(f"{self.inst_id} 当前价 {price:.8g} 不小于买点 {buy_level:.8g}，跳过")
@@ -1281,7 +1281,6 @@ class SymbolState:
             self.logger.debug(f"{self.inst_id} 买入跳过: {msg}")
             return None
 
-        # 计算买入金额
         raw_amount = balance * self.params.get("buy_ratio", 0.01)
         buy_amount = max(raw_amount, self.min_buy_amount)
         if buy_amount > balance:
@@ -1290,36 +1289,28 @@ class SymbolState:
             self.logger.info(f"{self.inst_id} 买入金额为0，跳过")
             return None
 
-        # 调用 API 下单
         fill = self.client.market_buy_quote(self.inst_id, buy_amount)
         now = time.time()
 
-        # 处理各种失败情况
         if fill is None:
-            # 网络超时或其他未知错误（返回 None）
             self.logger.error(f"{self.inst_id} API买入失败（未知错误），跳过")
             return self._handle_unknown_error(reason="未知错误（返回None）")
 
         if isinstance(fill, dict) and "error" in fill:
             error_msg = fill["error"]
             self.logger.error(f"{self.inst_id} API买入失败: {error_msg}")
-
-            # 分类错误
             error_lower = error_msg.lower()
-            # 1. 合规限制（51155）
             if "51155" in error_msg or "compliance" in error_lower or "restriction" in error_lower:
                 self.logger.warn(f"{self.inst_id} 因合规限制加入黑名单")
                 add_to_blacklist(self.inst_id, f"运行时错误: {error_msg[:100]}")
                 self._okx_available = False
                 self._remove_from_buy_queue()
                 return None
-            # 2. 订单限制（51201, exceed, market order）
             elif "51201" in error_msg or "exceed" in error_lower or "market order" in error_lower:
                 self.logger.warn(f"{self.inst_id} 因订单限制加入待观察列表，并从买入队列移除")
                 add_to_observe_list(self.inst_id, f"订单限制: {error_msg[:100]}")
                 self._remove_from_buy_queue()
                 return None
-            # 3. 其他错误 → 未知错误处理
             else:
                 return self._handle_unknown_error(reason=error_msg[:100])
 
@@ -1329,12 +1320,11 @@ class SymbolState:
         buy_amount = fill["cost"]
         reason = f"{reason} | ordId={fill.get('ord_id', '')} fee={fill.get('fee', 0):.8g}{fill.get('fee_ccy', '')}"
         self.logger.info(f"{self.inst_id} API买入成交: ordId={fill.get('ord_id')} 均价 {price:.8g} 数量 {qty:.8g} 花费 {buy_amount:.2f}", "buy_execute")
-        # 成功时重置失败计数和窗口
+        # 重置未知错误计数
         self._first_fail_time = 0.0
         self._fail_count_in_window = 0
         self._retry_after = 0.0
 
-        # 更新本地状态
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.has_position = True
         self.position_price = price
@@ -1358,6 +1348,12 @@ class SymbolState:
         self.stop_price = 0
         self._profit_notified_steps = set()
         self._last_processed_price = price
+
+        # 买入成功后重置买入信号
+        self.buy_signal_activated = False
+        self.buy_signal_lowest_price = 0.0
+        self.buy_signal_buy_level = ""
+        self.buy_signal_buy_price = 0.0
 
         _update_funds_for_view(get_okx_balance(force_refresh=True))
         refresh_positions_cache(force=True)
@@ -1384,21 +1380,16 @@ class SymbolState:
         return msg
 
     def _handle_unknown_error(self, reason: str):
-        """处理未知错误：窗口计数、延迟重试、加入观察列表"""
         now = time.time()
-        # 检查是否在同一窗口内（10分钟）
         if now - self._first_fail_time > self._window_duration:
-            # 窗口过期，重置
             self._first_fail_time = now
             self._fail_count_in_window = 1
             self._retry_after = now + self._retry_delay
             self.logger.info(f"{self.inst_id} 未知错误（第1次），{self._retry_delay}秒后重试")
             return None
         else:
-            # 窗口内
             self._fail_count_in_window += 1
             if self._fail_count_in_window >= 2:
-                # 第二次失败，加入待观察列表并剔除
                 self.logger.warn(f"{self.inst_id} 连续两次未知错误，加入待观察列表并移除买入队列")
                 add_to_observe_list(self.inst_id, f"未知错误连续失败: {reason[:100]}")
                 self._remove_from_buy_queue()
@@ -1407,9 +1398,6 @@ class SymbolState:
                 self._retry_after = 0.0
                 return None
             else:
-                # 第一次失败后的重试（但窗口内再次失败，此次为第二次，但上面的逻辑会处理）
-                # 理论上这里不会被执行，因为第一次失败时已经设置了_retry_after，第二次调用时会被_can_buy中的_retry_after拦截
-                # 但为保险，若直接调用本函数且窗口内计数<2，则设置重试延迟
                 self._retry_after = now + self._retry_delay
                 self.logger.info(f"{self.inst_id} 未知错误（第{self._fail_count_in_window}次），{self._retry_delay}秒后重试")
                 return None
@@ -1547,14 +1535,7 @@ class SymbolState:
             return self._execute_sell(price, f"止盈清仓 (峰值 {self.peak_price:.8g}, 止损 {stop_ratio*100:.1f}%)")
         return None
 
-    def check_buy_queue(self, price):
-        if self.has_position or self._is_in_cooldown() or self.inst_id in self.observe_list:
-            return None
-        buy_key, buy_level = self._get_buy_level(price)
-        if buy_key is not None:
-            sell_key, pair_name = self.levels.pair_map[buy_key][0], self.levels.pair_map[buy_key][1]
-            return self._execute_buy(price, f"价格 {price:.8g} 低于买点 {buy_level:.8g}", buy_key, sell_key, pair_name)
-        return None
+    # 移除了原有的 check_buy_queue 和 check_near_price，因为新逻辑在 update_price 中直接处理
 
     def update_price(self, price, ts):
         alerts = []
@@ -1563,6 +1544,7 @@ class SymbolState:
         self._last_processed_price = price
         self._last_processed_ts = ts
 
+        # 更新最高/最低
         if price > self.high:
             self.high = price
             self.levels.update(self.high, self.low)
@@ -1576,6 +1558,7 @@ class SymbolState:
             save_high_low_entry(self.inst_id, self.high, self.low)
             alerts.append(f"创新低 {price:.8g}")
 
+        # ========== 持仓状态：止盈和卖点 ==========
         if self.has_position:
             profit_pct = (price - self.position_price) / self.position_price if self.position_price > 0 else 0
             self._update_check_level(profit_pct)
@@ -1586,24 +1569,79 @@ class SymbolState:
                     self._save_state()
                     return alerts
 
-        if self.has_position and self.is_paired and not self.is_sold:
-            sell_price = self.pair_sell_line_price
-            if price >= sell_price:
-                result = self._execute_sell(price, f"{self.pair_type}卖点 {self.pair_sell_line} 触发")
-                if result:
-                    alerts.append(f"{self.pair_type}卖点清仓 @ {price:.8g}")
-                    self._save_state()
-                    return alerts
+            # 卖点触发
+            if self.is_paired and not self.is_sold:
+                sell_price = self.pair_sell_line_price
+                if price >= sell_price:
+                    result = self._execute_sell(price, f"{self.pair_type}卖点 {self.pair_sell_line} 触发")
+                    if result:
+                        alerts.append(f"{self.pair_type}卖点清仓 @ {price:.8g}")
+                        self._save_state()
+                        return alerts
 
+        # ========== 无持仓：买入信号逻辑 ==========
         if not self.has_position and not self._is_in_cooldown() and self.inst_id not in self.observe_list:
+            # 获取当前价格对应的最佳买点（价格低于买点）
             buy_key, buy_level = self._get_buy_level(price)
-            if buy_key is not None:
-                result = self.check_buy_queue(price)
-                if result:
-                    alerts.append(f"买入 @ {price:.8g}, 买点: {buy_key}")
-                    self._save_state()
-                    return alerts
 
+            # 处理买入信号激活/取消
+            if buy_key is not None:
+                # 价格跌破买点
+                if not self.buy_signal_activated:
+                    # 激活信号
+                    self.buy_signal_activated = True
+                    self.buy_signal_lowest_price = price
+                    self.buy_signal_buy_level = buy_key
+                    self.buy_signal_buy_price = buy_level
+                    self.buy_signal_attempt_time = 0.0
+                    self.logger.debug(f"{self.inst_id} 买入信号激活，买点 {buy_key} ({buy_level:.8g})，当前价 {price:.8g}")
+                else:
+                    # 已激活，更新最低价
+                    if price < self.buy_signal_lowest_price:
+                        self.buy_signal_lowest_price = price
+                        self.logger.debug(f"{self.inst_id} 更新最低价 {price:.8g}")
+            else:
+                # 价格不在任何买点之下
+                if self.buy_signal_activated:
+                    # 如果价格已回升至买点之上，取消信号
+                    if price >= self.buy_signal_buy_price:
+                        self.logger.debug(f"{self.inst_id} 价格回升至买点之上，取消买入信号")
+                        self.buy_signal_activated = False
+                        self.buy_signal_lowest_price = 0.0
+                        self.buy_signal_buy_level = ""
+                        self.buy_signal_buy_price = 0.0
+
+            # 检查是否满足买入条件：信号激活 && 反弹1% && 价格仍低于买点
+            if self.buy_signal_activated:
+                # 防止过于频繁尝试（至少间隔30秒）
+                now = time.time()
+                if now - self.buy_signal_attempt_time < 30:
+                    pass  # 跳过本次尝试
+                else:
+                    rebound_price = self.buy_signal_lowest_price * 1.01
+                    if price >= rebound_price and price < self.buy_signal_buy_price:
+                        self.logger.debug(f"{self.inst_id} 满足反弹买入条件：最低 {self.buy_signal_lowest_price:.8g}, 反弹1%={rebound_price:.8g}, 当前价 {price:.8g}")
+                        # 执行买入
+                        sell_key, pair_name = self.levels.pair_map[self.buy_signal_buy_level]
+                        result = self._execute_buy(
+                            price,
+                            f"反弹1%买入 (最低 {self.buy_signal_lowest_price:.8g})",
+                            self.buy_signal_buy_level,
+                            sell_key,
+                            pair_name
+                        )
+                        self.buy_signal_attempt_time = now  # 记录尝试时间
+                        if result:
+                            # 买入成功，信号会在 _execute_buy 中重置
+                            alerts.append(f"反弹买入 @ {price:.8g}, 买点: {self.buy_signal_buy_level}")
+                            self._save_state()
+                            return alerts
+                        # 如果买入失败（返回None），保留信号，等待下次条件
+                    else:
+                        # 条件不满足，不做操作
+                        pass
+
+        # 保存状态（常规）
         self._save_state()
         return alerts
 
@@ -1734,26 +1772,9 @@ class MarketEngine:
                 self.logger.debug(f"[{inst_id}] " + " | ".join(alerts))
 
     def _check_buy_queue_all(self):
-        self.logger.info("执行买入队列批量检查", "config_load")
-        queue = load_buy_queue()
-        checked = 0
-        for row in queue:
-            if row.get("status") != "待买入":
-                continue
-            inst_id = row.get("inst_id")
-            if not inst_id:
-                continue
-            state = self.states.get(inst_id)
-            if not state:
-                continue
-            price = state._last_processed_price
-            if price <= 0:
-                continue
-            checked += 1
-            result = state.check_buy_queue(price)
-            if result:
-                self.logger.info(f"买入队列执行: {result}", "buy_execute")
-        self.logger.info(f"买入队列检查完成: 检查 {checked} 个币对", "config_load")
+        # 注意：现在买入逻辑由 update_price 中的反弹机制触发，此函数仅用于手动触发检查（如有需求）
+        self.logger.info("执行买入队列批量检查（备用）", "config_load")
+        # 由于新逻辑已自动处理，这里不再重复执行
 
 # ==================== OKX 行情流 ====================
 def subscribe_okx_trades(sock, inst_ids):
@@ -1910,7 +1931,8 @@ def main():
 
     logger.info("=" * 60, "startup")
     logger.info("系统运行中，按 Ctrl+C 停止", "startup")
-    logger.info("检查频率: T0(实时) T1(1分钟) T2(15分钟) T3(30分钟) 买入队列(每日11:30/23:30)", "startup")
+    logger.info("买入规则：价格跌破买点后，从最低点反弹1%时买入（且价格仍低于买点）", "startup")
+    logger.info("检查频率: T0(实时) T1(1分钟) T2(15分钟) T3(30分钟)", "startup")
     logger.info("=" * 60, "startup")
 
     try:
@@ -1923,4 +1945,4 @@ def main():
         logger.info("程序退出", "shutdown")
 
 if __name__ == "__main__":
-    main()  
+    main()
